@@ -1,0 +1,81 @@
+x-app: &app
+  build: .
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+asyncpg://tgt:tgt@postgres:5432/tgt
+    REDIS_URL: redis://redis:6379/0
+    API_URL: http://api:8000
+    UPLOAD_DIR: /data/uploads
+    OLLAMA_URL: http://host.docker.internal:11434  # Ollama runs on the host (Metal/GPU access)
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - uploads:/data/uploads
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17-trixie  # postgres:17 + the vector extension; trixie = the same glibc collations
+    environment:
+      POSTGRES_USER: tgt
+      POSTGRES_PASSWORD: tgt
+      POSTGRES_DB: tgt
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports: ["127.0.0.1:5432:5432"]  # loopback only: the credentials are the defaults above
+    healthcheck:
+      # over TCP: during first-run initdb the server listens on the socket only, and migrate connects over TCP
+      test: ["CMD-SHELL", "pg_isready -U tgt -h localhost"]
+      interval: 3s
+      retries: 20
+
+  # Redis is also the job queue (streams), so keep it durable: queued sources survive a restart.
+  redis:
+    image: redis:7
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    ports: ["127.0.0.1:6379:6379"]  # loopback only: Redis has no password
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+
+  # One-shot: brings the schema up to date before any other service touches the database
+  migrate:
+    <<: *app
+    command: alembic upgrade head
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  api:
+    <<: *app
+    command: uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+    ports: ["127.0.0.1:8000:8000"]  # the bot reaches the API over the compose network; set API_TOKEN in .env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      retries: 30
+
+  worker:
+    <<: *app
+    command: python -m app.worker
+    depends_on:
+      api: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  bot:
+    <<: *app
+    command: python -m app.bot.main
+    depends_on:
+      api: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:
